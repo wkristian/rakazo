@@ -1,0 +1,10 @@
+region          = "eu-west-1"
+domain_name     = "app.example.com"
+route53_zone_id = "Z0000000000000EXAMPLE"
+
+# Set before the first start; the first account to register becomes the owner.
+signup_allowlist = "owner@example.com"
+
+# Optional: use Amazon Bedrock through the instance role.
+# bedrock_model_id = "replace-with-a-bedrock-model-or-inference-profile-id"
+# bedrock_resource_arns = ["arn:aws:bedrock:*::foundation-model/replace-with-model"]

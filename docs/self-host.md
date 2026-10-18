@@ -67,6 +67,8 @@ the local Docker computer. For in-stack Caddy plus remote E2B computers, use the
 [production Compose](#public-single-vm-deployment) path and `infra/compose/Caddyfile.prod`
 instead of this host proxy.
 
+For AWS (EC2, RDS, ALB and CloudFront provisioned with Terraform), see [Self-host on AWS](./self-host-aws.md).
+
 ### Restricted networks / mirror downloads
 
 If the installer, Compose downloads, or image pulls are blocked, use the

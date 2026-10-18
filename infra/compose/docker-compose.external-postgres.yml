@@ -1,0 +1,37 @@
+# Overlay for docker-compose.images.yml: use a managed Postgres (for example Amazon RDS)
+# instead of the bundled container. Set EXTERNAL_DATABASE_URL in .env, then:
+#
+#   docker compose --env-file .env \
+#     -f docker-compose.images.yml \
+#     -f docker-compose.external-postgres.yml \
+#     up -d
+#
+# The bundled postgres service moves behind a profile and is not started. Needs Docker
+# Compose 2.24+ for `!override`. POSTGRES_PASSWORD is still required by the base file
+# but unused; the API runs `prisma migrate deploy` against the external database on start.
+# Use a TLS URL, for example `?sslmode=no-verify` on RDS. Do not use this overlay to
+# publish a database on a public interface.
+
+services:
+  postgres:
+    profiles: ["bundled-postgres"]
+
+  api:
+    environment:
+      DATABASE_URL: ${EXTERNAL_DATABASE_URL:?Set EXTERNAL_DATABASE_URL in .env}
+    depends_on: !override
+      data-init:
+        condition: service_completed_successfully
+      supervisor:
+        condition: service_healthy
+
+  worker:
+    environment:
+      DATABASE_URL: ${EXTERNAL_DATABASE_URL:?Set EXTERNAL_DATABASE_URL in .env}
+    depends_on: !override
+      data-init:
+        condition: service_completed_successfully
+      supervisor:
+        condition: service_healthy
+      api:
+        condition: service_healthy

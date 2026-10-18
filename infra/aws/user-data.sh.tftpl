@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+# Boot-time setup for the Rakazo Docker host. Runs once as root through cloud-init.
+# Log: /var/log/rakazo-bootstrap.log
+set -Eeuo pipefail
+exec > >(tee -a /var/log/rakazo-bootstrap.log) 2>&1
+
+export DEBIAN_FRONTEND=noninteractive
+BASE="https://raw.githubusercontent.com/${rakazo_repo}/${rakazo_ref}/infra/compose"
+APP_DIR=/opt/rakazo
+
+apt-get update
+apt-get install -y ca-certificates curl openssl python3 xfsprogs snapd
+
+# Data volume for bot homes, uploads and container images. Docker must not start
+# before it is mounted, or its data would land on the root disk.
+device=/dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_${data_volume_id}
+for _ in $(seq 1 60); do
+  [ -e "$device" ] && break
+  sleep 5
+done
+[ -e "$device" ] || { echo "data volume did not attach" >&2; exit 1; }
+blkid "$device" >/dev/null || mkfs.xfs "$device"
+install -d /var/lib/docker
+uuid=$(blkid -s UUID -o value "$device")
+grep -q "$uuid" /etc/fstab || echo "UUID=$uuid /var/lib/docker xfs defaults,nofail 0 2" >>/etc/fstab
+mountpoint -q /var/lib/docker || mount /var/lib/docker
+
+# Docker Engine 26+ from Docker's own repository.
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+chmod a+r /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+  >/etc/apt/sources.list.d/docker.list
+apt-get update
+install -d /etc/docker /etc/systemd/system/docker.service.d
+curl -fsSL "$BASE/docker-daemon.json" -o /etc/docker/daemon.json
+printf '[Unit]\nRequiresMountsFor=/var/lib/docker\n' >/etc/systemd/system/docker.service.d/data-volume.conf
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+systemctl enable --now docker
+
+snap install aws-cli --classic
+
+install -d -m 0755 "$APP_DIR"
+cd "$APP_DIR"
+
+# Compose files, helper scripts and a .env with generated secrets.
+export RAKAZO_DOWNLOAD_BASE="$BASE"
+curl -fsSL "$BASE/install-images.sh" -o install-images.sh
+bash install-images.sh --prepare-only
+curl -fsSL "$BASE/docker-compose.external-postgres.yml" -o docker-compose.external-postgres.yml
+curl -fsSL "$BASE/restrict-computer-egress.sh" -o restrict-computer-egress.sh
+
+set_env() {
+  python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+key, value = sys.argv[1], sys.argv[2]
+path = "/opt/rakazo/.env"
+with open(path) as handle:
+    lines = [line for line in handle.read().splitlines() if not re.match(rf"{re.escape(key)}=", line)]
+lines.append(f"{key}='{value}'")
+with open(path, "w") as handle:
+    handle.write("\n".join(lines) + "\n")
+PY
+}
+
+secret=$(aws secretsmanager get-secret-value --region "${region}" --secret-id "${db_secret_arn}" \
+  --query SecretString --output text)
+password=$(printf '%s' "$secret" | python3 -c 'import json, sys, urllib.parse; print(urllib.parse.quote(json.load(sys.stdin)["password"], safe=""))')
+# RDS enforces TLS. no-verify encrypts the link without bundling the RDS CA into the images.
+set_env EXTERNAL_DATABASE_URL "postgres://rakazo:$password@${db_address}:5432/rakazo?sslmode=no-verify"
+unset secret password
+
+set_env BETTER_AUTH_URL "https://${domain_name}"
+set_env WEB_ORIGIN "https://${domain_name}"
+set_env API_URL "https://${domain_name}"
+set_env RAKAZO_HOST "${domain_name}"
+set_env RAKAZO_IMAGE_TAG "${image_tag}"
+set_env RAKAZO_COMPUTER_IMAGE_TAG "${image_tag}"
+set_env SANDBOX_COMPUTER_EGRESS restricted
+%{ if signup_allowlist != "" ~}
+set_env SIGNUP_ALLOWLIST "${signup_allowlist}"
+%{ endif ~}
+%{ if bedrock_model_id != "" ~}
+set_env PI_DEFAULT_CREDENTIALS host
+set_env PI_DEFAULT_PROVIDER amazon-bedrock
+set_env PI_DEFAULT_MODEL "${bedrock_model_id}"
+set_env AWS_REGION "${region}"
+%{ endif ~}
+
+# Bot computers may only reach the public internet, never the instance role.
+bash restrict-computer-egress.sh
+
+# TLS ends at CloudFront and the load balancer. Caddy only routes on this host,
+# the same split as infra/compose/Caddyfile.prod.
+cat >Caddyfile <<'CADDY'
+{
+	auto_https off
+	servers {
+		trusted_proxies static private_ranges
+	}
+}
+
+:80 {
+	encode zstd gzip
+
+	handle /health {
+		reverse_proxy 127.0.0.1:3100
+	}
+	handle /api/* {
+		reverse_proxy 127.0.0.1:3100
+	}
+	handle /rpc/* {
+		reverse_proxy 127.0.0.1:3100
+	}
+	handle {
+		reverse_proxy 127.0.0.1:5173
+	}
+}
+CADDY
+
+compose=(docker compose --env-file .env -f docker-compose.images.yml -f docker-compose.external-postgres.yml)
+"$${compose[@]}" pull
+"$${compose[@]}" up -d --wait --wait-timeout 600
+
+docker run -d --name rakazo-proxy --restart unless-stopped --network host \
+  -v "$APP_DIR/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2
+
+echo "Rakazo bootstrap finished"
